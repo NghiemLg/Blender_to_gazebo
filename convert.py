@@ -2,6 +2,7 @@ import bpy
 import os
 import shutil
 import xml.etree.ElementTree as ET
+import re
 from xml.dom import minidom
 from bpy_extras.io_utils import ImportHelper
 from bpy.props import StringProperty
@@ -11,7 +12,124 @@ from bpy.types import Operator
 
 ########################################################################################################################
 ### Exports model.dae of the scene with textures, its corresponding model.sdf file, and a default model.config file ####
+### Now also injects per-visual collisions with material-based surface parameters on first run.                    ####
 ########################################################################################################################
+
+# --- Collision material presets ---
+MATERIALS = {
+    "wood": {"mu": 0.5, "mu2": 0.5, "restitution": 0.2},
+    "concrete": {"mu": 1.0, "mu2": 1.0, "restitution": 0.05},
+    "glass": {"mu": 0.4, "mu2": 0.4, "restitution": 0.03},
+    "default": {"mu": 0.8, "mu2": 0.8, "restitution": 0.05},
+}
+
+# --- Heuristic category detection (EN + VI common keywords) ---
+WOOD_KEYS = [
+    # EN
+    "tree", "forest", "trunk", "branch", "wood", "bark", "plant",
+    # VI
+    "go", "gỗ", "cay", "cây", "than", "thân", "canh", "cành",
+]
+GLASS_KEYS = [
+    # EN
+    "glass", "window", "glazing",
+    # VI
+    "kinh", "kính", "cua_kinh", "cửa kính", "mat_kinh", "mặt kính", "vach_kinh", "vách kính",
+]
+ROAD_KEYS = [
+    # EN
+    "road", "street", "avenue", "lane", "alley", "highway", "junction", "intersection",
+    "crossing", "crosswalk", "roundabout", "parking", "parking_lot", "surfacearea", "roadarea",
+    "pavement", "sidewalk", "walkway", "driveway", "kerb", "curb", "asphalt", "concrete",
+    # VI
+    "duong", "đường", "pho", "phố", "ngo", "ngõ", "ngach", "ngách", "dai_lo", "đại lộ",
+    "vach", "vạch", "bai_do", "bãi đỗ", "via_he", "vỉa hè", "loi_di", "lối đi", "be_tong", "bê tông",
+    "nhua", "nhựa",
+]
+
+
+def _sanitize_name(name: str) -> str:
+    s = name.strip()
+    s = re.sub(r"[^0-9A-Za-z_]+", "_", s)
+    if s and s[0].isdigit():
+        s = f"n_{s}"
+    return s
+
+
+def _pick_material(name: str) -> str:
+    n_norm = name.lower().replace(" ", "_")
+    if any(k in n_norm for k in WOOD_KEYS):
+        return "wood"
+    if any(k in n_norm for k in GLASS_KEYS):
+        return "glass"
+    if any(k in n_norm for k in ROAD_KEYS):
+        return "concrete"
+    return "default"
+
+
+def _add_collision_for_visual(link_el: ET.Element, visual_el: ET.Element, existing_names: set, meshes_folder_prefix: str, dae_filename: str):
+    """Create a collision sibling for given visual, copying its geometry and adding surface params."""
+    vname = visual_el.get("name", "visual")
+    col_name = _sanitize_name(f"col_{vname}")
+    if col_name in existing_names:
+        return False
+
+    geom = visual_el.find("geometry")
+    if geom is None:
+        # Visual without geometry shouldn't happen here, skip
+        return False
+
+    # Build <collision>
+    collision = ET.Element("collision", attrib={"name": col_name})
+
+    # Copy geometry structure to collision
+    # For robustness, rebuild minimal geometry from known export pattern
+    mesh = geom.find("mesh")
+    if mesh is not None:
+        # Deep copy the existing mesh node
+        collision_geom = ET.SubElement(collision, "geometry")
+        collision_mesh = ET.SubElement(collision_geom, "mesh")
+        # uri
+        uri_el = mesh.find("uri")
+        uri_text = uri_el.text if uri_el is not None else meshes_folder_prefix + dae_filename
+        uri_copy = ET.SubElement(collision_mesh, "uri")
+        uri_copy.text = uri_text
+        # submesh
+        submesh = mesh.find("submesh")
+        if submesh is not None:
+            submesh_copy = ET.SubElement(collision_mesh, "submesh")
+            name_node = submesh.find("name")
+            name_text = name_node.text if name_node is not None else vname
+            name_copy = ET.SubElement(submesh_copy, "name")
+            name_copy.text = name_text
+    else:
+        # Fallback: copy whole geometry
+        collision.append(ET.fromstring(ET.tostring(geom)))
+
+    # Surface parameters based on heuristic
+    mkey = _pick_material(vname)
+    preset = MATERIALS[mkey]
+    surface = ET.SubElement(collision, "surface")
+    friction = ET.SubElement(surface, "friction")
+    ode = ET.SubElement(friction, "ode")
+    ET.SubElement(ode, "mu").text = str(preset["mu"])
+    ET.SubElement(ode, "mu2").text = str(preset["mu2"])
+    if mkey == "glass":
+        ET.SubElement(ode, "slip1").text = "0.02"
+        ET.SubElement(ode, "slip2").text = "0.02"
+    bounce = ET.SubElement(surface, "bounce")
+    ET.SubElement(bounce, "restitution_coefficient").text = str(preset["restitution"])
+    ET.SubElement(bounce, "threshold").text = "100.0"
+    contact = ET.SubElement(surface, "contact")
+    ode_c = ET.SubElement(contact, "ode")
+    ET.SubElement(ode_c, "kp").text = "1e6"
+    ET.SubElement(ode_c, "kd").text = "1.0"
+
+    # Insert right after the visual element for readability
+    idx = list(link_el).index(visual_el) + 1
+    link_el.insert(idx, collision)
+    existing_names.add(col_name)
+    return True
 def export_sdf(prefix_path):
     dae_filename = 'model.dae'  # Giữ nguyên theo yêu cầu
     sdf_filename = 'model.sdf'  # Giữ nguyên theo yêu cầu
@@ -89,7 +207,8 @@ def export_sdf(prefix_path):
 
     link = ET.SubElement(model, "link", attrib={"name": "testlink"})
 
-    # Thêm <visual> cho mỗi mesh
+    # Thêm <visual> cho mỗi mesh và tự động thêm <collision> tương ứng
+    existing_collision_names = set()
     for o in mesh_objects:
         visual = ET.SubElement(link, "visual", attrib={"name": o.name})
 
@@ -103,6 +222,7 @@ def export_sdf(prefix_path):
         
         # Kiểm tra và thêm material chỉ khi có texture
         diffuse_map = ""
+        metal_node = None
         if o.active_material and o.active_material.node_tree:
             nodes = o.active_material.node_tree.nodes
             principled = next((n for n in nodes if n.type == 'BSDF_PRINCIPLED'), None)
@@ -125,21 +245,33 @@ def export_sdf(prefix_path):
             specular = ET.SubElement(material, "specular")
             specular.text = "0.0 0.0 0.0 1.0"
             pbr = ET.SubElement(material, "pbr")
-            metal = ET.SubElement(pbr, "metal")
-            albedo_map = ET.SubElement(metal, "albedo_map")
+            metal_node = ET.SubElement(pbr, "metal")
+            albedo_map = ET.SubElement(metal_node, "albedo_map")
             albedo_map.text = meshes_folder_prefix + diffuse_map
         
         # Kiểm tra lightmap (tùy chọn)
         lightmap_full_path = os.path.join(meshes_path, lightmap_filename)
         if os.path.isfile(lightmap_full_path):
-            light_map = ET.SubElement(metal, "light_map", attrib={"uv_set": "1"})  # UV set 1
+            # Đảm bảo có pbr/metal để đặt light_map, nếu chưa có thì tạo tối thiểu
+            if metal_node is None:
+                material = visual.find("material")
+                if material is None:
+                    material = ET.SubElement(visual, "material")
+                pbr = material.find("pbr")
+                if pbr is None:
+                    pbr = ET.SubElement(material, "pbr")
+                metal_node = ET.SubElement(pbr, "metal")
+            light_map = ET.SubElement(metal_node, "light_map", attrib={"uv_set": "1"})  # UV set 1
             light_map.text = meshes_folder_prefix + lightmap_filename
             cast_shadows = ET.SubElement(visual, "cast_shadows")
             cast_shadows.text = "0"  # Tắt bóng
         else:
             print(f"Lightmap {lightmap_filename} không tìm thấy trong {meshes_path}")
 
-    # Không thêm <light> hoặc <collision> theo yêu cầu
+        # Tự động thêm collision dựa trên visual vừa tạo
+        _add_collision_for_visual(link, visual, existing_collision_names, meshes_folder_prefix, dae_filename)
+
+    # Không thêm <light> (đã thêm <collision> tự động ở trên)
 
     # Ghi SDF vào file
     try:
