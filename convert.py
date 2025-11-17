@@ -173,6 +173,14 @@ def export_sdf(prefix_path):
             check_existing=False,
             apply_modifiers=True,  # Áp dụng modifiers
             triangulate=True,     # Triangulate mesh
+            include_normals=True,
+            include_uvs=True,
+            include_material_textures=True,
+            use_mesh_modifiers=True,
+            export_selected_only=False,    # ← THÊM DÒNG NÀY (đảm bảo export toàn scene)
+            selected_objects_only=False,   # ← (tương tự)
+            sort_by_name=True,             # ← giúp submesh đúng thứ tự
+            open_sim=True,
             filter_blender=False,
             filter_image=False,
             filter_movie=False,
