@@ -171,16 +171,18 @@ def export_sdf(prefix_path):
         bpy.ops.wm.collada_export(
             filepath=os.path.join(meshes_path, dae_filename),
             check_existing=False,
-            apply_modifiers=True,  # Áp dụng modifiers
-            triangulate=True,     # Triangulate mesh
-            include_normals=True,
+            apply_modifiers=True,
+            triangulate=True,
+            include_normals=True,           # ← BẬT NORMALS (quan trọng nhất!)
             include_uvs=True,
             include_material_textures=True,
             use_mesh_modifiers=True,
-            export_selected_only=False,    # ← THÊM DÒNG NÀY (đảm bảo export toàn scene)
-            selected_objects_only=False,   # ← (tương tự)
-            sort_by_name=True,             # ← giúp submesh đúng thứ tự
-            open_sim=True,
+            sort_by_name=True,
+            open_sim=True,                  # ← Tối ưu cho Gazebo/Ignition
+            # Các tham số SAI đã bị xóa:
+            # export_selected_only=False,     ← XÓA
+            # selected_objects_only=False,    ← XÓA
+            # Các filter giữ nguyên
             filter_blender=False,
             filter_image=False,
             filter_movie=False,
